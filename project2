@@ -4,8 +4,7 @@ import cv2
 import random
 import copy
 from . import data_augment
-import threading
-import itertools
+
 
 #并集
 def union(au, bu, area_intersection):
