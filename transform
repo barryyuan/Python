@@ -1,0 +1,260 @@
+import ctypes
+from ctypes import *
+import numpy as np
+import cv2
+import os
+import sys
+from PIL import Image
+import pickle
+import time
+import multiprocessing
+
+sys.path.append("kfblibrary")
+
+class imageinfo(Structure):
+    _fields_ = [("DataFilePTR", c_int)]
+
+# Is the patch backgraound?
+def isbackground(img):
+    c0 = np.mean(img[:, :, 0])
+    c1 = np.mean(img[:, :, 1])
+    c2 = np.mean(img[:, :, 2])
+
+    temp = [np.abs(c0 - c1), np.abs(c0 - c2), np.abs(c1 - c2)]
+
+    diff = np.max(temp)
+
+    if diff > maxdiff:
+        return False
+    else:
+        return True
+
+def isbackground2(img):
+    img = Image.fromarray(img)
+    gray = img.convert('L')
+    bw = gray.point(lambda x: 0 if x < 220 else 1, 'F')
+    avgBkg = np.average(bw)
+
+    if avgBkg >= (backpercent / 100):
+        return True
+    else:
+        return False
+
+def read_func(share_img, selected_sets, width, step):
+    datalength = c_int(0)
+    blockheight = c_int(0)
+    blockwidth = c_int(0)
+    imagedata = POINTER(c_ubyte)()
+    fscale = c_float(20.0)
+
+    info = imageinfo()
+    imagelib.InitImageFileFunc(byref(info), pathname)
+
+    for posy in selected_sets:
+        for posx in range(0, width, step):
+            imagelib.GetImageRGBDataStreamFunc(byref(info), fscale, c_int(posx), c_int(posy), byref(datalength),
+                                               byref(blockwidth), byref(blockheight), byref(imagedata))
+            imagearray = np.array(imagedata[0:blockheight.value * blockwidth.value * 3], dtype=np.uint8)
+
+            imagearray = imagearray.reshape(blockheight.value, blockwidth.value, 3)
+            # change rgb to bgr for save if use opencv
+            imagearray = imagearray[:, :, (2, 1, 0)]
+
+            # copy the block into out image
+            share_img[posy:posy + blockheight.value, posx:posx + blockwidth.value, :] = imagearray
+            imagelib.DeleteImageDataFunc(imagedata)
+            del imagearray
+
+    # close file
+    imagelib.UnInitImageFileFunc(byref(info))
+
+def write_mask(share_img, share_patch_mask, selected_sets, widnum):
+    for i in selected_sets:
+        for j in range(widnum):
+            imgarray = share_img[i * sampleheight:(i + 1) * sampleheight, j * samplewidth:(j + 1) * samplewidth, :]
+
+            if isbackground2(imgarray) or isbackground(imgarray):
+                share_patch_mask[i, j] = False
+            else:
+                share_patch_mask[i, j] = True
+
+pathname = sys.argv[1]
+output_path = sys.argv[2]
+output_path2 = sys.argv[3]
+
+saved = False
+if len(sys.argv) >= 5 and sys.argv[4].lower() == 'true':
+    saved = True
+
+scaled = 1
+if len(sys.argv) == 6:
+    if sys.argv[5].isdigit():
+        scaled = int(sys.argv[5])
+    else:
+        print('scaled parameter is not digit, and ignored')
+
+maxdiff = 20
+backpercent = 50.0
+samplewidth = 300
+sampleheight = 300
+
+info = imageinfo()
+imageheight = c_int(0)
+imagewidth = c_int(0)
+scanscale = c_int(0)
+spendtime = c_float(0)
+scantime = c_double(0)
+imagecapres = c_float(0)
+imageblocksize = c_int(0)
+fscale = c_float(20.0)
+workers = 8  # multi-process
+
+imagelib = ctypes.CDLL('./kfblibrary/libImageOperationLib.so')
+basename = os.path.basename(pathname)
+basename = basename[0:basename.rfind('.')]
+
+if os.path.exists(output_path + basename):
+    print(basename + ' has exist')
+    exit()
+
+ret = imagelib.InitImageFileFunc(byref(info), pathname)
+if ret == 0:
+    print('error load image files')
+    exit()
+
+imagelib.GetHeaderInfoFunc.argtypes = [POINTER(imageinfo), POINTER(c_int), POINTER(c_int), POINTER(c_int),
+                                       POINTER(c_float), POINTER(c_double), POINTER(c_float), POINTER(c_int)]
+imagelib.GetHeaderInfoFunc(byref(info), byref(imageheight), byref(imagewidth), byref(scanscale), \
+                           byref(spendtime), byref(scantime), byref(imagecapres), byref(imageblocksize))
+
+if scanscale.value < fscale.value:   #for float and int diff
+    print('Error: the scan scale is smaller than needed scale')
+    print('the scanscale is %d'%(scanscale.value))
+    exit()
+
+#if scanscale is 40, print one caution, not think scale <20
+if scanscale.value != fscale.value:
+    print('find a image file: ' + pathname + ' with ' + str(scanscale) + 'X')
+    print('40X kfb image height and width are : %d, %d' % (imageheight.value, imagewidth.value))
+    print('resize the image by '+str(fscale.value)+'X')
+    imageheight.value=imageheight.value /2
+    imagewidth.value=imagewidth.value/2
+
+print('begin process file:' + basename + '.kfb  ......... at ' + time.asctime(time.localtime(time.time())))
+
+# round height and width
+imageheight.value = imageheight.value / imageblocksize.value * imageblocksize.value
+imagewidth.value = imagewidth.value / imageblocksize.value * imageblocksize.value
+
+print('the extracted kfb image height and width are : %d, %d' % (imageheight.value, imagewidth.value))
+
+imagelib.GetImageRGBDataStreamFunc.argtypes = [POINTER(imageinfo), c_float, c_int, c_int, POINTER(c_int), \
+                                               POINTER(c_int), POINTER(c_int), POINTER(POINTER(c_ubyte))]
+
+print('begin reading image data  ......')
+process = []
+share_img_s = multiprocessing.Array(c_ubyte, imageheight.value * imagewidth.value * 3)
+share_img = np.frombuffer(share_img_s.get_obj(), dtype=np.uint8).reshape(imageheight.value, imagewidth.value, 3)
+
+# read one kfb file
+posy_sets = range(0, imageheight.value, imageblocksize.value)
+for i in range(workers):
+    selected_sets = posy_sets[i:len(posy_sets):workers]    #the i workers' job
+    p = multiprocessing.Process(target=read_func,
+                                args=(share_img, selected_sets, imagewidth.value, imageblocksize.value))
+    process.append(p)
+
+for i in range(workers):
+    process[i].start()
+
+for i in range(workers):
+    process[i].join()
+
+print('finish reading image data at ' + time.asctime(time.localtime(time.time())))
+
+# images to patches
+print("begin image to patches: " + basename)
+widnum = int(round(share_img.shape[1] / samplewidth))
+heinum = int(round(share_img.shape[0] / sampleheight))
+
+rect_imageheight = sampleheight * heinum  # rectifed image size based on samplewidth
+rect_imagewidth = samplewidth * widnum
+print('the rectified image size are %d, %d' % (rect_imageheight, rect_imagewidth))
+
+share_patch_mask_s = multiprocessing.Array(c_bool, heinum * widnum)   # true is patches, otherwise background
+share_patch_mask = np.frombuffer(share_patch_mask_s.get_obj(), dtype=np.bool).reshape(heinum, widnum)
+
+num_sets = range(heinum)
+process = []
+for i in range(workers):
+    selected_sets = num_sets[i:len(num_sets):workers]    #the i workers' job
+    p = multiprocessing.Process(target=write_mask, args=(share_img, share_patch_mask, selected_sets, widnum))
+    process.append(p)
+
+for i in range(workers):
+    process[i].start()
+
+for i in range(workers):
+    process[i].join()
+
+# save image
+print('write the image file')
+os.mkdir(output_path + basename)
+fw_info = open(output_path + basename + '/' + basename + '_info', 'w')
+split_width = 1  # if split image or not based on image size
+split_height = 1
+
+# save image data into one, more images based on image size
+temp_size = rect_imageheight
+while temp_size >= 30000:
+    split_height += 1
+    temp_size = temp_size / 2
+
+temp_size = rect_imagewidth
+while temp_size > 30000:
+    split_width += 1
+    temp_size = temp_size / 2
+
+step_height = int(heinum / split_height) + 1  # patches of one image
+step_width = int(widnum / split_width) + 1
+
+# save some necessary info
+pickle.dump(split_height, fw_info)  # image count at height
+pickle.dump(split_width, fw_info)  # image count at width
+pickle.dump(sampleheight, fw_info)  # patch height
+pickle.dump(samplewidth, fw_info)  # patch width
+pickle.dump(share_patch_mask, fw_info)  # save mask of patches and background
+
+saved_dict = {}
+# save image data
+for ii in range(split_height):
+    for jj in range(split_width):
+        saved_name = basename + '_' + str(ii) + '_' + str(jj) + '.jpg'
+
+        ret = cv2.imwrite(output_path + basename + '/' + saved_name, \
+                          share_img[
+                          ii * step_height * sampleheight:min((ii + 1) * step_height * sampleheight, rect_imageheight), \
+                          jj * step_width * samplewidth:min((jj + 1) * step_width * samplewidth, rect_imagewidth), :])
+
+        saved_height = min((ii + 1) * step_height * sampleheight, rect_imageheight) - ii * step_height * sampleheight
+        saved_width = min((jj + 1) * step_width * samplewidth, rect_imagewidth) - jj * step_width * samplewidth
+        saved_dict[saved_name] = str(saved_height) + '_' + str(saved_width)
+
+pickle.dump(saved_dict, fw_info)
+
+# save preview images
+if saved == True and scaled > 1:
+    print('the scaled factor is ' + str(scaled))
+    img_scaled = share_img[0:rect_imageheight:scaled, 0:rect_imagewidth:scaled, :]
+
+    ret = cv2.imwrite(output_path2 + basename + '.jpg', img_scaled)
+    del img_scaled
+
+print(ret)
+
+print('end process file:' + basename + '.kfb   at ' + time.asctime(time.localtime(time.time())))
+
+# close file
+imagelib.UnInitImageFileFunc(byref(info))
+fw_info.close()
+print('\n')
